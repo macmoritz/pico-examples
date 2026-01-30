@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "hardware/gpio.h"
 #include "hardware/interp.h"
@@ -72,21 +73,20 @@ static const uint8_t ili9341_init_seq[] = {
 
 static inline void lcd_set_dc_cs(bool dc, bool cs) {
   sleep_us(1);
-  gpio_put_masked((1u << PIN_DC) | (1u << PIN_CS),
-                  !!dc << PIN_DC | !!cs << PIN_CS);
+  gpio_put_masked((1u << PIN_DC) | (1u << PIN_CS), !!dc << PIN_DC | !!cs << PIN_CS);
   sleep_us(1);
 }
 
-static inline void lcd_write_cmd(PIO pio, uint sm, const uint8_t *cmd,
-                                 size_t count) {
+static inline void lcd_write_cmd(PIO pio, uint sm, const uint8_t *cmd, size_t count) {
   ili9341_lcd_wait_idle(pio, sm);
   lcd_set_dc_cs(0, 0);
   ili9341_lcd_put(pio, sm, *cmd++);
-  if (count >= 2) {
+  if (count > 1) {
     ili9341_lcd_wait_idle(pio, sm);
     lcd_set_dc_cs(1, 0);
-    for (size_t i = 0; i < count - 1; ++i)
+    for (size_t i = 0; i < count - 1; ++i) {
       ili9341_lcd_put(pio, sm, *cmd++);
+    }
   }
   ili9341_lcd_wait_idle(pio, sm);
   lcd_set_dc_cs(1, 1);
@@ -108,6 +108,54 @@ static inline void ili9341_start_pixels(PIO pio, uint sm) {
   uint8_t cmd = 0x2c; // RAMWR
   lcd_write_cmd(pio, sm, &cmd, 1);
   lcd_set_dc_cs(1, 0);
+}
+
+void ili9341_address_set(PIO pio, uint sm, uint16_t column_start, uint16_t column_end, uint16_t row_start, uint16_t row_end) {
+  // CASET (0x2a)
+  // 1st Parameter: SC[15:8]
+  // 2nd Parameter: SC[7:0]
+  // 3rd Parameter: EC[15:8]
+  // 4th Parmeter EC[7:0]
+  // PASET (0x2b)
+  // 1st Parameter: SP[15:8]
+  // 2nd Parameter: SP[7:0]
+  // 3rd Parameter: EP[15:8]
+  // 4th Parameter: EP[7:0] 
+  // RAMWR (0x2c)
+  // Image Data
+  // TODO: check parameters
+  // printf("addressSet: cs %d | ce %d | rs %d | re %d\n", column_start, column_end, row_start, row_end);
+  uint8_t buffer[5];
+
+  buffer[0] = 0x2a; // CASET - Column address set
+  buffer[1] = (column_start >> 8) & 0xff;
+  buffer[2] = column_start & 0xff;
+  buffer[3] = (column_end >> 8) & 0xff;
+  buffer[4] = column_end & 0xff;
+  lcd_write_cmd(pio, sm, buffer, 5);
+
+  buffer[0] = 0x2b; // PASET - Page adress set - pages are equivalent to rows
+  buffer[1] = (row_start >> 8) & 0xff;
+  buffer[2] = row_start & 0xff;
+  buffer[3] = (row_end >> 8) & 0xff;
+  buffer[4] = row_end & 0xff;
+  lcd_write_cmd(pio, sm, buffer, 5);
+}
+
+void ili9341_draw_area(PIO pio, uint sm, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t *data) {
+  ili9341_address_set(pio, sm, x, x+w-1, y, y+h-1);
+
+  ili9341_start_pixels(pio, sm);
+
+  uint16_t color = 0x00;
+  for (int xx = 0; xx < w; xx++) {
+    for (int yy = 0; yy < h; yy++) {
+      color = data[yy * w + xx];
+      ili9341_lcd_put(pio, sm, color >> 8);
+      ili9341_lcd_put(pio, sm, color & 0xff);
+    }
+  }
+  lcd_set_dc_cs(1, 1);
 }
 
 int main() {
@@ -141,6 +189,19 @@ int main() {
 
   lcd_init(pio, sm, ili9341_init_seq);
   gpio_put(PIN_BL, 1);
+
+  size_t size = 320-240;
+  uint16_t pixels[size * size];
+  memset(&pixels, 0xffff, sizeof(pixels));
+  for (int i = 0; i < size; i++) {
+    for (int j = 0; j < size; j++) {
+      if (i == 0 || j == 0 || i == size-1 || j == size-1 || 
+      i == 1 || j == 1 || i == size-2 || j == size-2) {
+        pixels[i * size + j] = 0xf900;
+      }
+    }
+  }
+  ili9341_draw_area(pio, sm, SCREEN_WIDTH-size, 320-size, size, size, pixels);
 
   // Other SDKs: static image on screen, lame, boring
   // Raspberry Pi Pico SDK: spinning image on screen, bold, exciting
@@ -180,16 +241,30 @@ int main() {
                          (int32_t)(cosf(theta) * (1 << UNIT_LSB))};
     interp0->base[0] = rotate[0];
     interp0->base[1] = rotate[2];
+    // ili9341_start_pixels(pio, sm);
+    // for (int y = 0; y < SCREEN_HEIGHT; ++y) {
+    //   interp0->accum[0] = rotate[1] * y;
+    //   interp0->accum[1] = rotate[3] * y;
+    //   for (int x = 0; x < SCREEN_WIDTH; ++x) {
+    //     uint16_t colour = *(uint16_t *)(interp0->pop[2]);
+    //     ili9341_lcd_put(pio, sm, colour >> 8);
+    //     ili9341_lcd_put(pio, sm, colour & 0xff);
+    //   }
+    // }
+
+    ili9341_address_set(pio, sm, 0, SCREEN_HEIGHT-1, 0, SCREEN_WIDTH-1);
     ili9341_start_pixels(pio, sm);
+    uint16_t color = 0x00;
     for (int y = 0; y < SCREEN_HEIGHT; ++y) {
       interp0->accum[0] = rotate[1] * y;
       interp0->accum[1] = rotate[3] * y;
       for (int x = 0; x < SCREEN_WIDTH; ++x) {
-        uint16_t colour = *(uint16_t *)(interp0->pop[2]);
-        ili9341_lcd_put(pio, sm, colour >> 8);
-        ili9341_lcd_put(pio, sm, colour & 0xff);
+        color = *(uint16_t *)(interp0->pop[2]);
+        ili9341_lcd_put(pio, sm, color >> 8);
+        ili9341_lcd_put(pio, sm, color & 0xff);
       }
     }
+    lcd_set_dc_cs(1, 1);
   
     const int64_t delta = absolute_time_diff_us(time, to_us_since_boot(get_absolute_time()));
     printf("vBlank stuff took %lld us\n", delta);
